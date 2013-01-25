@@ -1,7 +1,7 @@
 (in-package #:cl-user)
 
 (defpackage #:view-server
-  (:use #:cl #:clouchdb #:parenscript)
+  (:use #:cl #:clouchdb #:parenscript #:bordeaux-threads)
   (:export #:start-view-server
            #:stop-view-server
            #:*view-server-port*
@@ -10,15 +10,18 @@
            #:ad-hoc-lisp-view
            #:lisp-view
            #:with-doc-slots
+           #:emit
            #:@))
 
 (in-package :view-server)
 (defvar *view-package* :view-server)
 (defvar *view-server-thread* nil)
-(defvar *view-server-port* 5478)
+(defvar *view-server-port* 5477)
 (defvar *stop-view-server* nil)
 (defvar *view-server-threads* nil)
-(defvar *view-server-lock* (bordeaux-threads:make-recursive-lock))
+(defvar *view-server-lock* (make-recursive-lock))
+(defparameter *in-maps* nil)
+(defparameter *map-results* nil)
 (defvar *maps* nil)
 
 (defmacro with-gensyms (syms &body body)
@@ -33,64 +36,16 @@
               syslog:+log-pid+))
 
 (defun emit (x y)
-  (list x y))
-
-(defgeneric aget (key alistish)
-  (:documentation "Do a `key' lookup in `alistish' and return two
-  values: the actual value and whether the lookup was successful (just
-  like `gethash' does)."))
-
-(defmethod aget (key (alist list))
-  "The value of `key' in `alist'"
-  (let ((x (assoc key alist :test #'equal)))
-    (values
-     (cdr x)
-     (consp x))))
-
-(defmethod aget (key (hash hash-table))
-  (gethash key hash))
-
-(defmethod (setf aget) (value key (hash hash-table))
-  (setf (gethash key hash) value))
-
-(defmethod (setf aget) (value key (alist list))
-  (if (null (assoc key alist))
-      (progn
-        (rplacd alist (copy-alist alist))
-        (rplaca alist (cons key value))
-        value)
-      (cdr (rplacd (assoc key alist) value))))
-
-(defun @ (alist key &rest more-keys)
-  "Swiss army knife function for alists and any objects for whom
-  `aget' has been defined. It works on alistish objects much much like
-  the dot `.' works in many other object oriented
-  languages (eg. Python, JavaScript).
-
-  (@ alistish-object :foo :bar :baz) is equivalent to
-  calling (aget :baz (aget :bar (aget :foo x))), or
-  alistish_object.foo.bar.baz in JS. A setter for `@' is also
-  defined.
-
-  It returns two values: the actual value and whether the lookup was
-  successful (just like `gethash' does).
-
-  `equal' is used for testing identity for keys."
-  (if (null more-keys)
-      (aget key alist)
-      (apply '@ (aget key alist) more-keys)))
-
-(defun (setf @) (val alist key &rest more-keys)
-  (if (null more-keys)
-      (setf (aget key alist) val)
-      (setf (apply #'@ (aget key alist) more-keys) val)))
+  (if view-server::*in-maps*
+      (push (list x y) view-server::*map-results*)
+      (list x y)))
 
 (defun add-thread (thread)
-  (bordeaux-threads:with-lock-held (*view-server-lock*)
+  (with-lock-held (*view-server-lock*)
     (pushnew thread *view-server-threads*)))
 
 (defun remove-thread (thread)
-  (bordeaux-threads:with-lock-held (*view-server-lock*)
+  (with-lock-held (*view-server-lock*)
     (setq *view-server-threads*
           (delete thread *view-server-threads*))))
 
@@ -99,7 +54,7 @@
        (if (> (get-universal-time) timeout)
            (progn
              (logger :err "~A timing out!"
-                     (bordeaux-threads:current-thread))
+                     (current-thread))
              (sb-thread:return-from-thread "timeout!"))
            (sleep 0.01))))
 
@@ -135,24 +90,49 @@
 
 (defun create-lisp-view (id &rest view-defs)
   "Create one or more views in the specified view document ID."
-  (create-view id (clouchdb::string-join view-defs) :language "cl"))
+  (create-view id (clouchdb::string-join view-defs) :language "lisp"))
+
+(defun my-ad-hoc-view (view &rest options &key key start-key
+                       start-key-docid end-key end-key-docid limit stale
+                       descending skip group group-level reduce
+                       include-docs (language "lisp"))
+  "Execute query using an ad-hoc view."
+  (declare (ignore key start-key start-key-docid end-key end-key-docid
+                   limit stale descending skip group group-level
+                   reduce include-docs))
+  (clouchdb::ensure-db ()
+    (clouchdb::db-request (clouchdb::cat
+                           (clouchdb::url-encode (clouchdb::db-name *couchdb*))
+                           "/_temp_view")
+                          :method :post
+                          :external-format-out clouchdb::+utf-8+
+                          :content-type "application/json"
+                          :content-length nil
+                          :parameters (clouchdb::transform-params
+                                       options clouchdb::*view-options*)
+                          :content
+                          (clouchdb::cat "{\"language\" : \"" language "\","
+                                         "\"map\" : " view "}"))))
 
 (defun ad-hoc-lisp-view (body)
   (my-ad-hoc-view
    (json:encode-json-to-string (format nil "~S" body))
-   :language "cl"))
+   :language "lisp"))
 
 (defun apply-view-maps (input maps stream)
   (let ((result (mapcar #'(lambda (fn)
-                            (funcall fn (second input)))
+                            (let ((view-server::*map-results* nil)
+                                  (view-server::*in-maps* t))
+                              (funcall fn (second input))
+                              (reverse view-server::*map-results*)))
                         maps)))
-    ;;(logger :err "~A RESULT: ~A" *package* result)
+    ;;(logger :info "~A RESULT: ~A" *package* result)
     (format stream "[")
     (dotimes (i (length result))
       (let ((r (nth i result)))
         (if (null r)
             (format stream "[[]]")
-            (clouchdb::document-to-json-stream (list r) stream)))
+            (clouchdb::document-to-json-stream r stream)))
       (unless (= i (1- (length result)))
         (format stream ",")))
     (format stream "]~%")))
@@ -210,11 +190,7 @@
            (format stream "true~%"))
           ((equalp (car input) "add_fun")
            (handler-case
-               (setq *maps*
-                     (append *maps*
-                             (list
-                              (eval (read-from-string
-                                     (second input))))))
+               (push (eval (read-from-string (second input))) *maps*)
              (:no-error (r)
                (declare (ignore r))
                ;;(logger :info "~A MAPS: ~A" *package* *maps*)
@@ -225,7 +201,7 @@
                        1 "bad lisp" c))))
           ((equalp (car input) "map_doc")
            ;;(logger :err "mapping doc: ~A" (@ (second input) :|_id|))
-           (apply-view-maps input *maps* stream))
+           (apply-view-maps input (reverse *maps*) stream))
           ((equalp (car input) "reduce")
            ;;(logger :info "reducing doc: ~A" (second input))
            (apply-reduces input stream))
@@ -247,7 +223,7 @@
          (process-request request stream)))))
 
 (defun accept-handler (socket)
-  (bordeaux-threads:make-thread
+  (make-thread
    #'(lambda ()
        (logger :debug "IN ACCEPT-HANDLER FOR ~A" socket)
        (unwind-protect
@@ -256,18 +232,18 @@
                   (view-server-loop stream))
               (end-of-file (c)
                 (logger :err "~A got EOF on ~A"
-                        (bordeaux-threads:current-thread) socket)
+                        (current-thread) socket)
                 (sb-thread:return-from-thread c)))
          (progn
            (logger :debug "terminating ~A" socket)
            (ignore-errors (usocket:socket-close socket))
-           (remove-thread (bordeaux-threads:current-thread)))))
+           (remove-thread (current-thread)))))
   :name (format nil "~A handler" socket)))
 
 (defun start-view-server (&key (address "127.0.0.1") (port *view-server-port*))
   (setq *stop-view-server* nil
         *view-server-thread*
-        (bordeaux-threads:make-thread
+        (make-thread
          #'(lambda ()
              (logger :info "Starting view-server on port ~A" port)
              (usocket:with-server-socket (listener (usocket:socket-listen
@@ -289,11 +265,12 @@
                         (logger :err
                                 "UNHANDLED ERROR OF TYPE ~A IN VIEW-SERVER: ~A"
                                 (type-of c) c)))))
-             (logger :info "Shutting down view-server on port ~A" port)))))
+             (logger :info "Shutting down view-server on port ~A" port))
+         :name "view-server-thread")))
 
 (defun stop-view-server ()
-  (when (bordeaux-threads:threadp *view-server-thread*)
+  (when (threadp *view-server-thread*)
     (setq *stop-view-server* t)
-    (loop until (not (bordeaux-threads:thread-alive-p *view-server-thread*))
+    (loop until (not (thread-alive-p *view-server-thread*))
        do (sleep 0.1)))
   (setq *view-server-thread* nil))
