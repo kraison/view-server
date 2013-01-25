@@ -1,4 +1,4 @@
 view-server
 ===========
 
-CouchDB view server in cmmon lisp
+CouchDB view server in Common Lisp.
