@@ -28,13 +28,6 @@
   `(let ,(loop for s in syms collect `(,s (gensym)))
     ,@body))
 
-(defun logger (level msg &rest args)
-  (syslog:log "view-server"
-              :local6
-              level
-              (apply #'format nil msg args)
-              syslog:+log-pid+))
-
 (defun emit (x y)
   (if view-server::*in-maps*
       (push (list x y) view-server::*map-results*)
@@ -53,8 +46,7 @@
   (loop until (listen stream) do
        (if (> (get-universal-time) timeout)
            (progn
-             (logger :err "~A timing out!"
-                     (current-thread))
+             (log:error "~A timing out!" (current-thread))
              (sb-thread:return-from-thread "timeout!"))
            (sleep 0.01))))
 
@@ -126,7 +118,7 @@
                               (funcall fn (second input))
                               (reverse view-server::*map-results*)))
                         maps)))
-    ;;(logger :info "~A RESULT: ~A" *package* result)
+    (log:debug "~A RESULT: ~A" *package* result)
     (format stream "[")
     (dotimes (i (length result))
       (let ((r (nth i result)))
@@ -141,7 +133,7 @@
   ;; ["reduce",["function(k, v) { return sum(v); }"],
   ;; [[[1,"699b524273605d5d3e9d4fd0ff2cb272"],10],
   ;; [[2,"c081d0f69c13d2ce2050d684c7ba2843"],20],[[null,"foobar"],3]]]
-  ;;(logger :info "REDUCE: ~A" input)
+  (log:debug "REDUCE: ~A" input)
   (handler-case
       (let ((fns (mapcar #'(lambda (fn)
                              (eval (read-from-string fn)))
@@ -154,7 +146,7 @@
                       (mapcar #'(lambda (fn)
                                   (funcall fn keys data nil))
                               fns)))))
-          ;;(logger :info "REDUCE SENDING ~A" json)
+          (log:debug "REDUCE SENDING ~A" json)
           (format stream "~A" json)
           (terpri stream)))
     (error (c)
@@ -163,7 +155,7 @@
 
 (defun apply-rereduces (input stream)
   ;;["rereduce",["function(k, v, r) { return sum(v); }"],[33,55,66]]\n
-  ;;(logger :info "REREDUCE: ~A" input)
+  (log:debug "REREDUCE: ~A" input)
   (handler-case
       (let ((fns (mapcar #'(lambda (fn)
                              (eval (read-from-string fn)))
@@ -175,7 +167,7 @@
                       (mapcar #'(lambda (fn)
                                   (funcall fn nil data t))
                               fns)))))
-          ;;(logger :info "REREDUCE SENDING ~A" json)
+          (log:debug "REREDUCE SENDING ~A" json)
           (format stream "~A" json)
           (terpri stream)))
     (error (c)
@@ -183,7 +175,7 @@
               1 "rereduce error" c))))
 
 (defun process-request (request stream)
-  (logger :err "view-server read: ~A" request)
+  (log:debug "view-server read: ~A" request)
   (let ((input (json-to-document request)))
     (cond ((equalp (car input) "reset")
            (setq *maps* nil)
@@ -193,23 +185,27 @@
                (push (eval (read-from-string (second input))) *maps*)
              (:no-error (r)
                (declare (ignore r))
-               ;;(logger :info "~A MAPS: ~A" *package* *maps*)
+               (log:debug "~A MAPS: ~A" *package* *maps*)
                (format stream "true~%"))
              (error (c)
-               (logger :info "VIEW-SERVER: ~A" c)
+               (log:debug "VIEW-SERVER: ~A" c)
                (format stream "{\"error\":\"~A\",\"reason\":\"~A: ~A\"}~%"
                        1 "bad lisp" c))))
           ((equalp (car input) "map_doc")
-           ;;(logger :err "mapping doc: ~A" (@ (second input) :|_id|))
+           (log:debug "mapping doc: ~A" (@ (second input) :|_id|))
            (apply-view-maps input (reverse *maps*) stream))
           ((equalp (car input) "reduce")
-           ;;(logger :info "reducing doc: ~A" (second input))
+           (log:debug "reducing doc: ~A" (second input))
            (apply-reduces input stream))
           ((equalp (car input) "rereduce")
-           ;;(logger :info "rereducing doc: ~A" (second input))
+           (log:debug "rereducing doc: ~A" (second input))
            (apply-rereduces input stream))
+          ((equalp (car input) "ddoc")
+           (log:debug "Got design doc: ~D" input)
+           nil)
           (t
-           (logger :err "Don't know hot to handle ~A" input))))
+           (log:error "Don't know hot to handle ~A" input)
+           nil)))
   (force-output stream))
 
 (defun view-server-loop (stream)
@@ -225,17 +221,16 @@
 (defun accept-handler (socket)
   (make-thread
    #'(lambda ()
-       (logger :debug "IN ACCEPT-HANDLER FOR ~A" socket)
+       (log:debug "IN ACCEPT-HANDLER FOR ~A" socket)
        (unwind-protect
             (handler-case
                 (let ((stream (usocket:socket-stream socket)))
                   (view-server-loop stream))
               (end-of-file (c)
-                (logger :err "~A got EOF on ~A"
-                        (current-thread) socket)
+                (log:error "~A got EOF on ~A" (current-thread) socket)
                 (sb-thread:return-from-thread c)))
          (progn
-           (logger :debug "terminating ~A" socket)
+           (log:debug "accept-handler terminating ~A" socket)
            (ignore-errors (usocket:socket-close socket))
            (remove-thread (current-thread)))))
   :name (format nil "~A handler" socket)))
@@ -245,7 +240,7 @@
         *view-server-thread*
         (make-thread
          #'(lambda ()
-             (logger :info "Starting view-server on port ~A" port)
+             (log:info "Starting view-server on port ~A" port)
              (usocket:with-server-socket (listener (usocket:socket-listen
                                                     address port :reuse-address t))
                (loop until *stop-view-server* do
@@ -259,13 +254,13 @@
                                   (add-thread thread))
                               (usocket:connection-aborted-error ())
                               (usocket:socket-error (c)
-                                (logger :err "View-server got error on ~A: ~A"
+                                (log:error "View-server got error on ~A: ~A"
                                         listener c)))))
                       (error (c)
-                        (logger :err
+                        (log:error
                                 "UNHANDLED ERROR OF TYPE ~A IN VIEW-SERVER: ~A"
                                 (type-of c) c)))))
-             (logger :info "Shutting down view-server on port ~A" port))
+             (log:info "Shutting down view-server on port ~A" port))
          :name "view-server-thread")))
 
 (defun stop-view-server ()

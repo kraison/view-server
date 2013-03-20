@@ -9,5 +9,5 @@
   :author "Kevin Raison <last name @ chatsubo dot net>"
   :version "0.1"
   :description "view-server"
-  :depends-on (:clouchdb :cl-json :cl-syslog :bordeaux-threads)
+  :depends-on (:clouchdb :cl-json :log4cl :bordeaux-threads)
   :components ((:file "view-server")))
