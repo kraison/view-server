@@ -1,7 +1,7 @@
 (in-package #:cl-user)
 
 (defpackage #:view-server
-  (:use #:cl #:clouchdb #:parenscript #:bordeaux-threads)
+  (:use #:cl #:clouchdb #:bordeaux-threads)
   (:export #:start-view-server
            #:stop-view-server
            #:*view-server-port*
@@ -10,8 +10,7 @@
            #:ad-hoc-lisp-view
            #:lisp-view
            #:with-doc-slots
-           #:emit
-           #:@))
+           #:emit))
 
 (in-package :view-server)
 (defvar *view-package* :view-server)
@@ -58,13 +57,13 @@
                     (cond ((eql slot-sym 'id)
                            `(id (@ ,d :|_id|)))
                           ((eql slot-sym 'rev)
-                           `(rev (@ ,d :|_rev|)))
+                           `(rev (cdr (assoc :|_rev| ,d))))
                           (t
                            (let ((key
                                   (intern
                                    (string-upcase (symbol-name slot-sym))
                                    :keyword)))
-                             `(,slot-sym (@ ,d ,key))))))
+                             `(,slot-sym (cdr (assoc ,key ,d)))))))
                 slots))
          ,@body))))
 
@@ -182,7 +181,7 @@
            (format stream "true~%"))
           ((equalp (car input) "add_fun")
            (handler-case
-               (push (eval (read-from-string (second input))) *maps*)
+	       (push (eval (read-from-string (second input))) *maps*)
              (:no-error (r)
                (declare (ignore r))
                (log:debug "~A MAPS: ~A" *package* *maps*)
@@ -192,7 +191,7 @@
                (format stream "{\"error\":\"~A\",\"reason\":\"~A: ~A\"}~%"
                        1 "bad lisp" c))))
           ((equalp (car input) "map_doc")
-           (log:debug "mapping doc: ~A" (@ (second input) :|_id|))
+           (log:debug "mapping doc: ~A" (cdr (assoc :|_id| (second input))))
            (apply-view-maps input (reverse *maps*) stream))
           ((equalp (car input) "reduce")
            (log:debug "reducing doc: ~A" (second input))
